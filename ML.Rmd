@@ -1,0 +1,617 @@
+---
+title: "Machine Learning"
+subtitle: ""
+author: ""
+date: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(AER)
+library(stargazer)
+library(statsr)
+library(rsample)
+library(parsnip)
+library(doParallel)
+library(ranger)
+library(glmnet)
+```
+
+<div class="alert alert-info">
+  <strong>Group Members:</strong> 
+(1.) Jian Hao Chiah
+(2.) Yunus Emre Bozkurt
+(3.) Nashita Behroz Jalil
+</div>
+
+## Recidivism 
+
+Recidivism -- the tendency for an individual who has previously committed a crime to commit another crime in the future. One key input to a judge’s sentencing decision is how likely a given convict is to re-offend, or recidivate. 
+
+We will be following a Pro Publica article that analyzes the output of COMPAS.  The article is [here](https://www.propublica.org/article/machine-bias-risk-assessments-in-criminal-sentencing).  Is not necessary to read it for this question.
+
+
+## Data
+
+The code below downloads the data used in the pro republica article.
+
+```{r, echo=TRUE}
+raw <- read_csv("https://raw.githubusercontent.com/propublica/compas-analysis/master/compas-scores-two-years.csv")
+```
+
+Minor cleaning:
+
+```{r eval=T, echo=T}
+## Main working data
+df <- raw %>% 
+        filter(days_b_screening_arrest <= 30) %>%
+        filter(days_b_screening_arrest >= -30) %>%
+        filter(is_recid != -1) %>%
+        filter(c_charge_degree != "O") %>%
+        filter(score_text != 'N/A') %>% 
+  rename(priors_count = `priors_count...15`,
+        decile_score =  `decile_score...12` )
+
+## clean main working data a bit more
+df <- df %>% 
+  mutate(length_of_stay = as.numeric(as.Date(df$c_jail_out) - as.Date(df$c_jail_in)),
+         charge_factor = fct_explicit_na(c_charge_desc),
+         race_factor = fct_explicit_na(race),
+         race_factor = fct_relevel(race_factor, "Caucasian"),
+         charge_factor = fct_lump_min(charge_factor, 30),
+         sex_factor = factor(sex, levels = c("Female","Male")),
+         priors_factor = ifelse(priors_count > 20, 20, priors_count),
+         priors_factor = factor(priors_factor),
+         two_year_recid = factor(two_year_recid)) %>% 
+  select(two_year_recid, age, sex_factor , juv_fel_count , juv_misd_count , juv_other_count , priors_count , c_charge_degree , charge_factor, race_factor, decile_score, length_of_stay) 
+
+feature_names <- names(df)[-c(1,10,11)]
+```
+
+## Recidivism Risk
+
+In the data, the variable `decile_score` is the COMPAS score actually used to evaluate a defendant's risk of recidivism.  Each individual in the data set was assigned a `decile_score` ranging from 1 to 10. This score represents the perceived risk of recidivism with 1 being the lowest risk and 10 being the highest. This score is produced from a criminal risk assessment algorithm.
+
+> Risk assessment tools are designed to do one thing: take in the details of a defendant’s profile and spit out a recidivism score --a single number estimating the likelihood that he or she will reoffend. A judge then factors that score into a myriad of decisions that can determine what type of rehabilitation services particular defendants should receive, whether they should be held in jail before trial, and how severe their sentences should be. A low score paves the way for a kinder fate. A high score does precisely the opposite. [excerpt taken from this article](https://www.technologyreview.com/2019/01/21/137783/algorithms-criminal-justice-ai/)
+
+The outcome variable in the data set is `two_year_recid`.  It is binary and equal to one if the individual had been jailed for a new crime in next two years from the original release date. 
+
+## Part I: Data visualization
+
+In a subset of the data focusing only on Caucasians and African-Americans (from `race_factor`), we construct:
+
+1. A bar chart showing the incidence of each `decile_score` by `race_factor`, with one panel for men and one for women.
+
+2. A figure that shows the actual recidivism rate vs `decile_score` by `race_factor`, with one panel for men and one for women.
+
+```{r eval=T, echo=T}
+dfI <- df %>% 
+  select(two_year_recid, sex_factor, race_factor, decile_score) %>% 
+  filter(race_factor %in% c("Caucasian","African-American")) %>% 
+  mutate(two_year_recid = as.numeric(as.character(two_year_recid)))
+```
+
+```{r fig.align = "center", fig.width = 8, eval=T, echo=T}
+###code here
+#Graph 1 --- bar chart
+g1 <- ggplot(dfI,
+       aes(x = decile_score,
+           fill = race_factor),
+       colour = race_factor,
+       line_type = race_factor) +
+  labs(title = "Incidence of Decile Score \n by Race",
+       x = "COMPAS Score",
+       y = "Count",
+       fill = "Race") +
+  geom_bar(position = 'dodge2', colour = 'black') +
+  #use geom_bar instead of geom_col as incidence refers to counting of number of cases at each x position
+  
+  facet_wrap(~sex_factor)
+
+g1 + scale_fill_manual(values = c("yellowgreen", "turquoise4")) + theme(plot.title = element_text(color="midnightblue", size=14, face="bold.italic"),legend.title = element_text(face = "bold"),legend.background = element_rect(fill="gray95", size=.5), legend.position = "bottom")
+```
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+a.	For Caucasian people (both male and female) there is a decreasing trend in number as the decile score increases, which is not the case for African-American people, their numbers seems to be constant throughout the COMPAS score 
+</div>
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+b.	After the COMPAS score 2.5 the scores of African-American people are higher than the Caucasians
+</div>
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+c. For males, the difference between the Caucasians and African-American people gets bigger as the COMPAS score increases (After approx. score - 3)
+</div>
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+d. Generally the count is higher for males than the females 
+</div>
+
+```{r eval=T, echo=T}
+#Graph 2 --- figure 
+fig <- dfI %>% 
+  group_by(sex_factor, race_factor, decile_score) %>% 
+  summarise(recid_rate = weighted.mean(two_year_recid, na.rm = T),
+            n = n())
+```
+```{r fig.align = "center", fig.width = 8, eval=T ,echo=T}
+g2 <- ggplot(fig,
+       aes(x = decile_score,
+           y = recid_rate,
+           colour = race_factor)) +
+  labs(title = "Actual Recidivism Rate vs Decile Score by Race",
+       x = "COMPAS Score",
+       y = "Actual Recidivism Rate",
+       colour = "Race") +
+  geom_line() +
+  facet_wrap(~sex_factor)
+
+
+
+g2 + theme(plot.title = element_text(color="midnightblue", size=14, face="bold.italic"), legend.title = element_text(face = "bold"), legend.background = element_rect(fill="gray95", size=.5), legend.position = "bottom")
+```
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+The line for African American male is higher in majority of the portion when it comes to actual recidivism, but in both of the sex’s case, when we compare those with COMPAS score around 9, African-American people are more in number with their actual recidivism. Overall, the graphs do seem to show a positive correlation, where the ones with higher score do end up with a higher recidivism rate. In terms of actual recidivism rate and its interaction with COMPAS score we do not see a significant difference between the males and females   
+</div>
+
+## Part II: Constructing our own risk score
+
+We constructed our own risk scores by first predicting the probability that an individual reoffends within two years given their observable characteristics in the data.  In constructing this risk score, we have as potential features the following: `r feature_names`.
+
+That is, our predictions shouldn't use the COMPAS `decile_score` nor `race_factor`.  We do not use race in making our predictions, since this is a protected category -- the idea being that a persons' risk score should be independent of race.
+
+Our risk scores will be constructed as follows (1) predict the probability of `two_year_recid` given available features, and (2) turn our predicted probabilities into a decile score to compare with COMPAS.  In making predictions, we will attempt to maximize the model accuracy, which is obviously not the only measure we could use, but seems like a good place to start.
+
+### Data splitting
+
+Split data into training and test set.  Remember to set the seed for reproducibility. 
+
+```{r eval=T, echo=TRUE}
+# data splitting here
+dfII <- df %>% 
+  select(-race_factor,
+         -decile_score)
+
+#sample split
+set.seed(1996)
+
+df_splits <- initial_split(dfII, prop = 3/4)
+# training and testing data
+train <- training(df_splits)
+test <- testing(df_splits)
+
+```
+
+
+### Logit
+
+We estimate a logit regression (with no penalty) that includes a flexible list of controls using the test data set.  
+
+```{r eval=T, echo=T}
+## Logit here
+rec_base <- recipe(
+  two_year_recid ~ .,
+  data = train
+  ) %>% 
+  step_dummy(all_nominal(), -two_year_recid) %>% #nominal 
+  step_normalize(all_predictors()) %>% #created dummy and normalized it
+  step_nzv(all_predictors()) #removes ones with little variation 
+
+# Examine object - juice / bake  
+base_dta <- rec_base %>% prep() %>% juice()  #Just to view
+
+# Step 2: Model
+mod_glm <- logistic_reg() %>% 
+  set_engine('glm')
+
+# Step 3: Workflow
+wf_base <- workflow() %>% 
+  add_recipe(rec_base) %>% 
+  add_model(mod_glm)  #adding part 1 and 2
+
+# Step 4: Fit
+fit_base <- wf_base %>% fit(data = train)    #without the workflow it will show all the steps (u can check by removing it) 
+#R suggested a swap from extract_fit_parsnip() to extract_fit_parsnip()
+
+testB <- test %>%
+  select(two_year_recid) %>%
+  bind_cols(predict(fit_base, new_data = test))
+
+testB
+
+```
+```{r eval=T, echo=T}
+#'Full' SPecification
+# Step 1:  recipe
+rec_full <- recipe(
+  two_year_recid ~ ., 
+  data = train
+  ) %>% 
+  step_dummy(all_nominal(), -two_year_recid) %>% 
+  step_interact(~ all_predictors() * all_predictors()) %>% 
+  step_poly(age, degree = 3) %>% 
+  step_normalize(all_predictors()) %>% 
+  step_nzv(all_predictors()) #kick out regression with no variation 
+
+# Step 2: Workflow
+wf_full <- workflow() %>% 
+  add_recipe(rec_full) %>% 
+  add_model(mod_glm)
+
+# Step 3: Fit
+fit_full <- wf_full %>% fit(data = train) 
+
+# Obtain predicted probabilities
+testF <- test %>%
+  select(two_year_recid) %>% 
+  bind_cols(predict(fit_full, new_data = test))
+test
+  
+table(cut_width(runif(5278), 0.1))
+```
+
+### Penalized regression
+
+We estimate penalized regressions (lasso, ridge, elastic net) of our Logit above. We `tune()` our hyper-parameters based on accuracy.  
+
+##Lasso
+
+```{r eval=T, echo=T}
+# penalized regression here
+# Lasso
+## Split training data into folds
+cv_splits <- vfold_cv(train, v = 5, repeats = 1)
+``` 
+```{r eval=T, echo=T}
+## Model
+lasso_model <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") #tune the penalty parameter - if we know that we can just type it in, here it sets hypothetical value
+
+## Workflow
+lasso_wf <- workflow() %>% 
+  add_model(lasso_model) %>%
+  add_recipe(rec_full) 
+```
+
+```{r eval=T, echo=T}
+#Tuning
+lambda_grid <- grid_regular(penalty(), levels = 50) 
+```
+```{r eval=T, echo=T}
+# tune grid
+cv_lasso <- tune_grid(
+  lasso_wf,
+  resamples = cv_splits, 
+  grid = lambda_grid
+  )  
+
+## Winner
+cv_lasso %>% 
+select_best(cv_lasso, metric = "accuracy") 
+```
+```{r eval=T, echo=T}
+## cv plot
+autoplot(cv_lasso, metric = "accuracy") 
+```
+```{r eval=T, echo=T}
+# extract optimal lambda
+opt_lambda <- cv_lasso %>%  select_best("accuracy")
+
+## Final fit
+fit_lasso <- finalize_workflow(lasso_wf, opt_lambda) %>% 
+  fit(data = train) %>% 
+  extract_fit_parsnip() #to replace pull_workflow_fit()
+```
+
+```{r eval=T, echo=T}
+# extract optimal lambda
+opt_lambda_1se <- cv_lasso %>% 
+  select_by_one_std_err(desc(penalty), metric = "accuracy", maximize = F) #select the least one, and 1 se lambda (one with bigger lambda will be simpler one)
+
+## Final fit
+fit_lasso_1se <- finalize_workflow(lasso_wf, opt_lambda_1se) %>% 
+  fit(data = train) %>% 
+  extract_fit_parsnip() #to replace pull_workflow_fit()
+```
+
+```{r eval=T, echo=T}
+
+#Comparing different methods
+# evaluation - add predicted values from each model to test data
+
+# first prep our test data
+
+test_baked <- bake(rec_full %>% prep(), new_data = test)
+test_base  <- bake(rec_base %>% prep(), new_data = test)  #applying recipe to test data set, twice - one for base and another for full 
+```
+```{r eval=F, echo=T}
+model.comp <- test %>%
+  select(two_year_recid) %>% 
+  bind_cols(predict(fit_base, new_data = test_base) %>% rename(base = .pred_class)) %>% 
+  bind_cols(predict(fit_full, new_data = test_baked) %>% rename(full = .pred_class)) %>% 
+  bind_cols(predict(fit_lasso, new_data = test_baked) %>% rename(lasso = .pred_class)) %>% 
+  bind_cols(predict(fit_lasso_1se, new_data = test_baked) %>% rename(lasso_1se = .pred_class)) 
+```
+
+##Ridge Regression
+
+```{r eval=TRUE, echo=TRUE}
+## Model
+ridge_model <- logistic_reg(penalty = tune(), mixture = 0) %>% ##added Logit 
+  set_engine("glmnet")
+
+## Workflow
+ridge_wf <- workflow() %>% 
+  add_model(ridge_model) %>%
+  add_recipe(rec_full)
+```
+```{r}
+lambda_grid <- grid_regular(penalty(), levels = 50)
+```
+```{r}
+cv_ridge <- tune_grid(
+  ridge_wf,
+  resamples = cv_splits, 
+  grid = lambda_grid
+  )  
+
+## Winner
+cv_ridge %>%  select_best("accuracy") 
+```
+```{r eval=TRUE, echo=TRUE}
+## cv plot
+autoplot(cv_ridge, metric = "accuracy") 
+
+```
+
+```{r eval=TRUE, echo=TRUE}
+# penalty
+opt_ridge <- cv_ridge %>%  select_best("accuracy") 
+
+## Final fit
+fit_ridge <- finalize_workflow(ridge_wf, opt_ridge) %>% fit( data = train) %>%   extract_fit_parsnip()
+
+
+#model.comp <- model.comp %>%
+  #bind_cols(predict(fit_ridge, new_data = test_baked) %>% rename(ridge = .pred)) 
+```
+```{r eval=F, echo=T}
+fig_data <- model.comp %>% 
+  pivot_longer(cols = c('base', 'full','lasso','lasso_1se','post_lasso','ridge'), names_to = "Model")
+
+ggplot(fig_data, aes(y = score, x = value)) + 
+  geom_point() +
+  geom_smooth(method = 'lm', se = F) +
+  facet_grid(~Model)
+
+fig_data %>% 
+  group_by(Model) %>% 
+  summarise(mse = mean((score - value)^2)) %>% 
+  arrange(mse)  
+```  
+  
+##Elastic net
+```{r eval=TRUE, echo=TRUE}
+
+EL_model <- logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+
+## Workflow
+EL_wf <- workflow() %>% 
+  add_model(EL_model) %>%
+  add_recipe(rec_full)
+
+
+# tune grid
+cv_EL <- tune_grid(
+  EL_wf,
+  resamples = cv_splits, 
+  grid = expand_grid(penalty = 10^seq(-3,1, length = 50), mixture = c(.25, .5, .75))
+  )  
+
+## Winner
+cv_EL %>%  select_best("accuracy")
+
+## cv plot
+autoplot(cv_EL, metric = "accuracy") 
+
+# penalty
+opt_EL <- cv_EL %>%  select_best("accuracy") 
+
+## Final fit
+fit_EL <- finalize_workflow(EL_wf, opt_EL) %>% fit( data = train) %>%   extract_fit_parsnip()
+
+```
+  
+```{r eval=F, echo=T}  
+model.comp <- model.comp %>%
+  #bind_cols(predict(fit_EL, new_data = test_baked) %>% rename(EL = .pred))
+
+fig_data <- model.comp %>% 
+  pivot_longer(cols = -score, names_to = "Model")
+
+ggplot(fig_data, aes(y = score, x = value)) + 
+  geom_point() +
+  geom_smooth(method = 'lm', se = F) +
+  facet_grid(~Model)
+
+fig_data %>% 
+  group_by(Model) %>% 
+  summarise(mse = mean((score - value)^2)) %>% 
+  arrange(mse)
+```
+  
+
+### Random Forest
+
+We estimate a random forest regression, with mode set to classification.  
+
+```{r eval=TRUE, echo=TRUE}
+# RF here
+
+rec_forest <- recipe(
+  two_year_recid ~ ., ntree = 100,
+  data = train
+)
+
+doParallel::registerDoParallel()
+
+forest_reg <- rand_forest(mtry = tune(), 
+                          engine = 'ranger',
+                          mode = 'classification') 
+
+wf_forest <- workflow() %>% 
+  add_recipe(rec_forest) %>% 
+  add_model(forest_reg)
+
+cv_forest <- tune_grid(
+  wf_forest,
+  resamples = cv_splits, 
+  #grid = grid_regular(mtry(range = c(1,12)),min_n(range = c(2L,15L)), levels = 12) #mtry - random try
+  #grid = grid_latin_hypercube(mtry(range = c(1,12)),min_n(range = c(2L,15L)), size = 30)
+  grid_max_entropy(mtry(range = c(1,12)),min_n(range = c(2L,15L)), size = 50)
+  )
+  
+cv_forest %>% select_best('accuracy')
+
+autoplot(cv_forest, metric = 'accuracy')
+
+# extract optimal mtry
+opt_mtry <- cv_forest %>%  select_best('accuracy')
+
+## Final fit
+fit_forest <- finalize_workflow(wf_forest, opt_mtry) %>% 
+  fit(data = train) %>% 
+  pull_workflow_fit()
+```
+```{r eval=F, echo=T}
+model.comp <- model.comp %>%
+  bind_cols(predict(fit_forest, new_data = test) %>% rename(rand_forest = .pred)) 
+```
+
+```{r eval=F, echo=T}
+fig_data <- model.comp %>% 
+  pivot_longer(cols = -score, names_to = "Model")
+
+ggplot(fig_data, aes(y = score, x = value)) + 
+  geom_point() +
+  geom_smooth(method = 'lm', se = F) +
+  facet_grid(~Model)
+
+fig_data %>% 
+  group_by(Model) %>% 
+  summarise(mse = mean((score - value)^2)) %>% 
+  arrange(mse) #random forest is the best 
+```
+
+### Predictions
+
+We add predicts of all our models to the test data.  For each of the predicted probabilities, we create a classifier using a cut-off of .5.  That is, classify someone as reoffending if their predicted probability is greater than 50 percent. We then calculated the accuracy and verify Which model performs the best.  
+
+Finally, we create our own COMPAS score based on forming 10 risk risk groups.
+
+```{r eval=F, echo=T}
+# Add predicted probabilities here.
+test_baked <- bake(rec_full %>% prep(), new_data = test, all_predictors())
+test_base <- bake (rec_base %>% prep(), new_data = test, all_predictors())
+
+test_results <- test%>%
+  select(two_year_recid) %>%
+  bind_cols(
+    restricted = predict(fit_base, new_data = test_base) %>% rename(Restricted = .pred),
+    full = predict(fit_full, new_data = test_baked)%>% rename(Full = .pred),
+    predict(fit_EL, new_data =test_baked)%>% rename(EL = .pred),
+    predict(fit_ridge, new_data = test_baked)%>% rename(Ridge = .pred),
+    predict(fit_lasso, new_data = test_baked) %>% rename(Lasso = .pred)
+  )
+```
+
+
+## Algorithm bias
+
+A check to see if the decile risk rankings have unintended bias: 
+
+```{r eval=F, echo=T}
+## Code here
+set.seed(1996)
+
+#splits
+df_splits2 <- initial_split(df, prob = 3/4)
+
+# training and testing data
+train2 <- training(df_splits2)
+test2 <- testing(df_splits2)
+
+
+models <- list(
+  model1  <- glm(decile_score ~ age+sex_factor+juv_fel_count+juv_misd_count+priors_count+c_charge_degree+juv_other_count+charge_factor+length_of_stay + race_factor, data = test2,family=binomial(link='logit')),
+
+model2  <- glm(lasso_score ~ age+sex_factor+juv_fel_count+juv_misd_count+priors_count+c_charge_degree+juv_other_count+charge_factor+length_of_stay + race_factor, data = test2, family=binomial(link='logit')))
+
+
+modelsummary(models,
+             stars = T, 
+             gof_omit = '[^R2|Num.Obs]') %>% 
+  kable_classic_2()
+
+```
+
+## Post script.
+
+We redid the two figures in the recidivism section using the `lasso_score` instead of `decile_score` using the test data:
+
+```{r eval=F, echo=T}
+dfII <- df %>% 
+  select(two_year_recid, sex_factor, race_factor, lasso_score) %>% 
+  filter(race_factor %in% c("Caucasian","African-American")) %>% 
+  mutate(two_year_recid = as.numeric(as.character(two_year_recid)))
+```
+
+```{r fig.align = "center", fig.width = 8, eval=FALSE, echo=TRUE}
+###code here
+#Graph 1 --- bar chart
+g1_1 <- ggplot(dfII,
+       aes(x = lasso_score,
+           fill = race_factor),
+       colour = race_factor,
+       line_type = race_factor) +
+  labs(title = "Incidence of Decile Score \n by Race",
+       x = "COMPAS Score",
+       y = "Count",
+       fill = "Race") +
+  geom_bar(position = 'dodge2', colour = 'black') +
+  #use geom_bar instead of geom_col as incidence refers to counting of number of cases at each x position
+  
+  facet_wrap(~sex_factor)
+
+g1_1 + scale_fill_manual(values = c("yellowgreen", "turquoise4")) + theme(plot.title = element_text(color="midnightblue", size=14, face="bold.italic"),legend.title = element_text(face = "bold"),legend.background = element_rect(fill="gray95", size=.5), legend.position = "bottom")
+```
+```{r eval=F, echo=T}
+#Graph 2 --- figure 
+fig_1 <- dfII %>% 
+  group_by(sex_factor, race_factor, lasso_score) %>% 
+  summarise(recid_rate = weighted.mean(two_year_recid, na.rm = T),
+            n = n())
+```
+```{r fig.align = "center", fig.width = 8, eval=FALSE, echo=TRUE}
+g2_1 <- ggplot(fig_1,
+       aes(x = lasso_score,
+           y = recid_rate,
+           colour = race_factor)) +
+  labs(title = "Actual Recidivism Rate vs Decile Score by Race",
+       x = "COMPAS Score",
+       y = "Actual Recidivism Rate",
+       colour = "Race") +
+  geom_line() +
+  facet_wrap(~sex_factor)
+
+
+
+g2_1 + theme(plot.title = element_text(color="midnightblue", size=14, face="bold.italic"), legend.title = element_text(face = "bold"), legend.background = element_rect(fill="gray95", size=.5), legend.position = "bottom") 
+```
+
+
